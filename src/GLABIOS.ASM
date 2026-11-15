@@ -554,7 +554,7 @@ RAM_TEST_LONG	=	0			; disable long RAM test
 RAM_PARITY		=	0			; disable memory parity/IO check
 
 TURBO_TYPE		=	TURBO_NONE		; disable Turbo features
-MAX_RAM_AUTO	=	1			; select max RAM from video switch
+MAX_RAM_AUTO	=	0			; keep 640K (auto-detect would map MCGA/CGA video RAM as system RAM)
 
 	IF ARCH_SUB_TYPE EQ ARCH_MIST
 ;----------------------------------------------------------------------------;
@@ -10855,8 +10855,13 @@ POST_SYS_VIDEO ENDP
 							;  SI now points to '8088'
 CPU_CHECK_TYPE_2:
 	TEST_GFLAG  V20				; ZF = 0 if V20, ZF = 1 if 8088
-	JZ	CPU_CHECK_TYPE_2_DONE		; jump if 8088
+	JZ	CPU_CHECK_NOT_V20			; jump if not V20
 	MOV	SI, OFFSET POST_V20		; if not, is V20
+	JMP	SHORT CPU_CHECK_TYPE_2_DONE
+CPU_CHECK_NOT_V20:
+	CALL	CPU_QUEUE_TEST			; ZF = 1 if 8088, ZF = 0 if 8086
+	JZ	CPU_CHECK_TYPE_2_DONE		; jump if 8088
+	MOV	SI, OFFSET POST_8086		; otherwise 8086
 CPU_CHECK_TYPE_2_DONE:
 	CALL	OUT_SZ				; write CPU type
 	POST_COL_END				; end first column
@@ -11057,6 +11062,86 @@ OUT_SZ_DONE:
 OUT_SZ ENDP
 OUT_SZ_ATTR ENDP
 POST_END_COL_STR ENDP
+
+;----------------------------------------------------------------------------;
+; Prefetch queue test: tells an 8088 (4 byte queue) from an 8086 (6 byte queue)
+;
+; A short self-modifying routine is copied to RAM at 0000:7000H and run:
+; REP STOSB overwrites the last three NOPs ahead with INC DX (42h) and DX counts
+; how many of the new bytes were fetched after the write. The 8088 fetches all
+; three, the 8086 has already queued some of the old NOPs.
+; Needs a CPU (or emulator) that models the prefetch queue.
+;
+; Output:
+;	ZF = 1 if 8088, ZF = 0 if 8086
+;
+; Clobbers: nothing else (AX, CX, DX, SI, DI, ES saved), interrupts disabled
+;----------------------------------------------------------------------------;
+CPU_QUEUE_TEST PROC
+	CLI
+	PUSH	AX
+	PUSH	CX
+	PUSH	DX
+	PUSH	DI
+	PUSH	SI
+	PUSH	ES
+	XOR	AX, AX
+	MOV	ES, AX				; ES = 0000, scratch RAM in low memory
+	MOV	DI, 7000H				; free during POST (boot sector goes to 7C00H)
+	PUSH	DI				; save RAM routine address
+	MOV	SI, OFFSET CQT_CODE
+	MOV	CX, OFFSET CQT_END - OFFSET CQT_CODE
+	CLD
+	DB	2EH					; CS: override, REP MOVSB source
+	REP	MOVSB				; copy routine to RAM
+	POP	DI				; DI = RAM routine
+	PUSH	CS				; far return address for the routine
+	MOV	AX, OFFSET CQT_RET
+	PUSH	AX
+	PUSH	ES				; ES = 0 = RAM code segment
+	PUSH	DI
+	RETF					; run the routine in RAM
+CQT_RET:
+	CMP	AL, 3				; 3 = all new bytes executed = 8088
+	POP	ES
+	POP	SI
+	POP	DI
+	POP	DX
+	POP	CX
+	POP	AX
+	RET
+
+;
+; Routine executed from RAM (position independent), returns the INC DX count in AL
+;
+CQT_CODE:
+	PUSH	CS
+	POP	ES				; ES = RAM code segment
+	XOR	DX, DX
+	STD
+	CALL	CQT_NEXT			; get own address
+CQT_NEXT:
+	POP	DI
+	ADD	DI, OFFSET CQT_LAST - OFFSET CQT_NEXT	; DI = last NOP
+	MOV	AL, 42H				; INC DX
+	MOV	CX, 3
+	REP	STOSB				; overwrite the last 3 NOPs (backwards)
+	CLD
+	NOP
+	NOP
+	NOP
+	NOP
+	NOP
+CQT_LAST:
+	NOP
+	MOV	AX, DX
+	RETF
+CQT_END:
+
+POST_8086		DB	'8086', 0
+
+CPU_QUEUE_TEST ENDP
+
 POST_END_COL ENDP
 
 ;----------------------------------------------------------------------------;
