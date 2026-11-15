@@ -8,6 +8,12 @@
 ;
 ; Copyright (c) 2022-2026, 640KB and contributors
 ;
+; MODIFIED VERSION (2026-11) for the WpfApp emulator, based on GLaBIOS 0.4.3:
+;  - 8086 vs 8088 detection (prefetch queue test), MCGA shown on POST
+;  - fatal POST errors (beep codes) are also written to the screen
+;  - descriptive POST error and boot failure messages
+; Changes are marked with "WpfApp" and are enabled by ARCH_TYPE=ARCH_EMU.
+;
 ;----------------------------------------------------------------------------;
 ;
 ; This program is free software: you can redistribute it and/or modify it under the terms 
@@ -60,6 +66,9 @@
 ;	1	3	Base RAM (0-16KB) read/write error
 ;	3	3	Error loading video adapter ROM
 ;	1	4	Base RAM (0-16KB) parity error
+;
+; WpfApp: with POST_HALT_MSG = 1 the code and its description are also
+; written directly to CGA/MDA video memory (see HALT_SHOW).
 ;
 ;----------------------------------------------------------------------------;
 
@@ -288,6 +297,10 @@ FE_CONF_LOCK	=	1		; lock FE2010 config register after init
 ROM_SCAN_ALIGN	=	1		; option ROM scan aligns to 2K boundaries
 OEM_KB_EXT		=	1		; allow EAh reset byte on ext. keyboard
 FEATURE_BYTES	=	1		; include build options in build binary
+POST_HALT_MSG	=	0		; WpfApp: show fatal POST (beep) errors on
+						;   screen by direct CGA/MDA access
+POST_ERR_LONG	=	0		; WpfApp: descriptive POST error, boot
+						;   failure and banner messages, MCGA
 
 ;----------------------------------------------------------------------------;
 ; Hardware hacks!
@@ -554,7 +567,9 @@ RAM_TEST_LONG	=	0			; disable long RAM test
 RAM_PARITY		=	0			; disable memory parity/IO check
 
 TURBO_TYPE		=	TURBO_NONE		; disable Turbo features
-MAX_RAM_AUTO	=	1			; select max RAM from video switch
+MAX_RAM_AUTO	=	0			; keep 640K (auto-detect would map MCGA/CGA video RAM as system RAM)
+POST_HALT_MSG	=	1			; WpfApp: fatal POST errors on screen
+POST_ERR_LONG	=	1			; WpfApp: descriptive POST messages
 
 	IF ARCH_SUB_TYPE EQ ARCH_MIST
 ;----------------------------------------------------------------------------;
@@ -3760,7 +3775,11 @@ BASE_RAM_TEST:
 BASE_RAM_ERROR:
 	MOV	BL, BEEP_SL <1,3>			; on failure, 1 short and 3 long beeps
 HALT_BEEP_1:
+			IF POST_HALT_MSG EQ 1
+	JMP	HALT_SHOW				; WpfApp: show error, then HALT_BEEP
+			ELSE
 	JMP	HALT_BEEP				; NEAR jump to HALT BEEP PROC
+			ENDIF
 BASE_RAM_ZERO:
 	MOV	AX, RAM_TEST			; test pattern
 	CALL_NS  MEM_CHECK			; write and verify test pattern
@@ -4267,7 +4286,11 @@ SETTINGS_SAVE:
 	JNZ	VID_MODE_OK				; jump if mode valid or video option ROM loaded
 	MOV	BL, BEEP_SL <3,3>			; Beep 3 long, 3 short
 HALT_BEEP_2:
+			IF POST_HALT_MSG EQ 1
+	JMP	HALT_SHOW				; WpfApp: show error, then HALT_BEEP
+			ELSE
 	JMP	HALT_BEEP				; NEAR jump to beep
+			ENDIF
 VID_MODE_OK:
 	TEST	DL, MASK VID			; is SW1 mode 00?
 	JZ	RESET_VIDEO_DONE			; if custom video ROM, skip reset
@@ -4710,9 +4733,94 @@ SET_EFLAG_FLP_RET:
 SET_EFLAG_FLP ENDP
 			ENDIF
 
+			IF POST_HALT_MSG EQ 1
+;----------------------------------------------------------------------------;
+; WpfApp: Show a fatal POST error on screen, then continue to HALT_BEEP
+;----------------------------------------------------------------------------;
+; The fatal errors happen before the video BIOS is usable (and maybe before
+; RAM works), so the 6845 of a CGA and of an MDA is programmed for 80x25 text
+; directly and the message is written to both video buffers. An adapter with
+; its own (not yet started) option ROM, such as EGA/VGA, may show nothing.
 ;
-; 11 BYTES HERE
+; Input:
+;	BL = beep pattern (high nibble = short beeps, low nibble = long beeps)
 ;
+; Cannot use stack or RAM. Preserves BL.
+;----------------------------------------------------------------------------;
+HALT_SHOW PROC
+	MOV	DX, 03D4H				; CGA 6845 index register
+	MOV	SI, OFFSET INT_1D_80		; CGA 80x25 CRTC parameters
+	MOV	DI, 0B800H				; CGA video segment
+HALT_SHOW_ADAPTER:
+	MOV	ES, DI
+	XOR	AX, AX				; AH = CRTC register index
+HALT_SHOW_CRTC:
+	MOV	AL, AH
+	OUT	DX, AL				; select register
+	INC	DX
+	LODS	BYTE PTR CS:[SI]
+	OUT	DX, AL				; write register
+	DEC	DX
+	INC	AH
+	CMP	AH, SIZE CRTC
+	JB	HALT_SHOW_CRTC
+	ADD	DX, 4					; mode control register (3D8H/3B8H)
+	MOV	AL, 29H				; 80 column text, video enabled, blink
+	OUT	DX, AL
+	XOR	DI, DI
+	MOV	AX, DBW <7, ' '>
+	MOV	CX, 80*25
+	REP	STOSW					; clear screen, CX = 0
+	XOR	DI, DI
+	MOV	SI, OFFSET HALT_MSG		; message, part 1
+	MOV	AH, 4FH				; white on red (MDA: bright)
+HALT_SHOW_SZ:
+	LODS	BYTE PTR CS:[SI]
+	TEST	AL, AL
+	JZ	HALT_SHOW_SZ_END
+	STOSW
+	JMP	HALT_SHOW_SZ
+HALT_SHOW_SZ_END:
+	INC	CX					; CX = 1 after part 1, 2 after part 2
+	CMP	CL, 2
+	JAE	HALT_SHOW_NEXT
+	MOV	AL, BL
+	AAM_I	10H					; AH = short beeps, AL = long beeps
+	OR	AX, '00'
+	XCHG	AX, DX				; DH = short digit, DL = long digit
+	MOV	AH, 4FH
+	MOV	AL, DH
+	STOSW
+	MOV	AL, '-'
+	STOSW
+	MOV	AL, DL
+	STOSW
+	MOV	SI, OFFSET HALT_TBL		; find the description of code BL
+HALT_SHOW_FIND:
+	LODS	BYTE PTR CS:[SI]			; AL = beep pattern of this entry
+	TEST	AL, AL
+	JZ	HALT_SHOW_SZ			; end of table: show the default
+	CMP	AL, BL
+	JE	HALT_SHOW_SZ			; found: show its description (part 2)
+HALT_SHOW_SKIP:
+	LODS	BYTE PTR CS:[SI]
+	TEST	AL, AL
+	JNZ	HALT_SHOW_SKIP
+	JMP	HALT_SHOW_FIND
+HALT_SHOW_NEXT:
+	MOV	AX, ES
+	CMP	AH, 0B0H				; MDA done too?
+	MOV	DX, 03B4H				; MDA 6845 index register
+	MOV	SI, OFFSET INT_1D_MDA		; MDA CRTC parameters
+	MOV	DI, 0B000H				; MDA video segment
+	JNE	HALT_SHOW_ADAPTER			; if not, repeat for MDA
+	JMP	HALT_BEEP				; beep the pattern in BL forever
+
+HALT_MSG	DB	'POST FAILED - beeps (short-long) ', 0
+
+HALT_SHOW ENDP
+			ENDIF
+
 BYTES_HERE	INT_02
 
 ;----------------------------------------------------------------------------;
@@ -5346,8 +5454,13 @@ BOOT_BEGIN		DB	CR, LF
 NL2_Z			DB	LF				; two NL's, null term'd
 					ENDIF
 NL_Z			DB	CR, LF, 0			; one NL, null term'd
+					IF POST_ERR_LONG EQ 1	; WpfApp: say what to do
+BOOT_FAIL		DB	'Disk Boot Fail: no bootable disk found.', CR, LF
+			DB	'Attach a bootable disk image, then press a key to restart.'
+					ELSE
 BOOT_FAIL		DB	'Disk Boot Fail.'
 			DB	' You monster.'
+					ENDIF
 NL2_ANY_KEY		DB	LF
 NL_ANY_KEY		DB	CR, LF
 ANY_KEY		DB	'Press the Any Key...'
@@ -5722,6 +5835,7 @@ TD_MEM_CLEAR_DONE:
 ; Input:
 ; 	DL = 0 if no parity error, bit 7 or 6 set if error
 ;
+			IF RAM_TEST_NONE NE 1 AND RAM_TEST_LONG EQ 1	; WpfApp: only used by the long RAM test
 DETECT_MEMORY_ERR:
 			IF ARCH_TYPE EQ ARCH_TD3300
 	PUSH	SI					; preserve SI for TD3300_MEM_CLEAR
@@ -5749,6 +5863,7 @@ DETECT_MEMORY_ERR_DONE:
 	POP	SI
 			ENDIF
 	JMP	SHORT DONE_ZERO_ALL_RAM
+			ENDIF				; WpfApp: /RAM_TEST_LONG EQ 1
 DETECT_MEMORY ENDP
 
 ;----------------------------------------------------------------------------;
@@ -6034,9 +6149,42 @@ CAS_READ_BYTE_RET:
 CAS_READ_BYTE ENDP
 CAS_READ_WORD ENDP
 		ENDIF				; CASSETTE EQ 1
+			IF POST_HALT_MSG EQ 1
+;----------------------------------------------------------------------------;
+; WpfApp: fatal POST error descriptions for HALT_SHOW, indexed by beep pattern
+; (see "POST Error Beep messages" at the top). Ends with a 0 pattern followed
+; by the default description.
 ;
-; 25 BYTES HERE / 22 BYTES HERE 5150
-;
+HALT_TBL	DB	BEEP_SL <2,1>, ': CPU register test', 0
+				IF POST_TEST_INST EQ 1
+		DB	BEEP_SL <3,1>, ': CPU instruction test', 0
+				ENDIF
+				IF CPU_TYPE EQ CPU_V20
+		DB	BEEP_SL <4,1>, ': V20 CPU required', 0
+				ENDIF
+				IF POST_TEST_CHK_ROM EQ 1
+		DB	BEEP_SL <2,2>, ': BIOS ROM checksum', 0
+				ENDIF
+				IF POST_TEST_PIT_1 EQ 1
+		DB	BEEP_SL <3,2>, ': timer (PIT)', 0
+				ENDIF
+				IF POST_TEST_DMA EQ 1
+		DB	BEEP_SL <4,2>, ': DMA registers', 0
+				ENDIF
+				IF POST_TEST_PIC_REG EQ 1
+		DB	BEEP_SL <5,2>, ': PIC registers', 0
+				ENDIF
+				IF POST_TEST_PIC_INT EQ 1
+		DB	BEEP_SL <5,3>, ': PIC interrupts', 0
+				ENDIF
+		DB	BEEP_SL <1,3>, ': base RAM (first 16 KB)', 0
+				IF RAM_PARITY EQ 1
+		DB	BEEP_SL <1,4>, ': base RAM parity', 0
+				ENDIF
+		DB	BEEP_SL <3,3>, ': no video adapter or video ROM', 0
+		DB	0, 0					; end of table, empty default
+			ENDIF
+
 BYTES_HERE	INT_19
 
 ;----------------------------------------------------------------------------;
@@ -6466,6 +6614,9 @@ PORT_TEST ENDP
 ;
 POST_VGA		DB	'VGA', 0
 POST_EGA		DB	'EGA', 0
+				IF POST_ERR_LONG EQ 1
+			DB	'M'				; WpfApp: 'MCGA', *must be before POST_CGA
+				ENDIF
 POST_CGA		DB	'CGA', 0
 		IF POST_VID_HGC EQ 1
 POST_MDA		DB	'MDA', 0
@@ -6755,9 +6906,11 @@ POST_ERR_MSG PROC
 ;
 POST_ERR		DB	CR, LF, 'POST '	; POST Error
 POST_ERR_ERR	DB	'Error ', 0		; Error
+				IF POST_ERR_LONG EQ 0	; WpfApp: else long strings (see OUT_CHAR)
 POST_ERR_PKI	DB	'KB',   0		; Reset returned non-success "301"
 POST_ERR_PKEY	DB	'Key',  0		; Reset did not clear KBC
 POST_ERR_PFDC	DB	'FDC',  0		; General FD init failure
+				ENDIF
 POST_ERR_PDMA	DB	'DMA',  0		; DMA TC0 error
 
 ;----------------------------------------------------------------------------;
@@ -10813,6 +10966,19 @@ CHECK_CGA:
 	JC	POST_SYS_VIDEO_DONE		; jump if MDA
 			ENDIF				; ENDIF POST_VID_HGC EQ 1
 	MOV	SI, OFFSET POST_CGA		; otherwise "CGA"
+			IF POST_ERR_LONG EQ 1
+;----------------------------------------------------------------------------;
+; WpfApp: MCGA (PS/2 Model 25/30) is driven as a CGA but has a video DAC:
+; the DAC write index register (3C8H) is readable, on a CGA nothing is there.
+;
+	MOV	DX, 03C8H				; DAC write index
+	MOV	AX, DBW <15H, 15H>		; test value (not a nearby opcode byte)
+	OUT	DX, AL
+	IN	AL, DX
+	CMP	AL, AH				; read back?
+	JNE	POST_SYS_VIDEO_DONE		; if not, is CGA
+	DEC	SI					; otherwise "MCGA"
+			ENDIF
 	JMP	SHORT POST_SYS_VIDEO_DONE
 
 ;----------------------------------------------------------------------------;
@@ -10855,8 +11021,13 @@ POST_SYS_VIDEO ENDP
 							;  SI now points to '8088'
 CPU_CHECK_TYPE_2:
 	TEST_GFLAG  V20				; ZF = 0 if V20, ZF = 1 if 8088
-	JZ	CPU_CHECK_TYPE_2_DONE		; jump if 8088
+	JZ	CPU_CHECK_NOT_V20			; jump if not V20
 	MOV	SI, OFFSET POST_V20		; if not, is V20
+	JMP	SHORT CPU_CHECK_TYPE_2_DONE
+CPU_CHECK_NOT_V20:
+	CALL	CPU_QUEUE_TEST			; ZF = 1 if 8088, ZF = 0 if 8086
+	JZ	CPU_CHECK_TYPE_2_DONE		; jump if 8088
+	MOV	SI, OFFSET POST_8086		; otherwise 8086
 CPU_CHECK_TYPE_2_DONE:
 	CALL	OUT_SZ				; write CPU type
 	POST_COL_END				; end first column
@@ -11057,6 +11228,86 @@ OUT_SZ_DONE:
 OUT_SZ ENDP
 OUT_SZ_ATTR ENDP
 POST_END_COL_STR ENDP
+
+;----------------------------------------------------------------------------;
+; Prefetch queue test: tells an 8088 (4 byte queue) from an 8086 (6 byte queue)
+;
+; A short self-modifying routine is copied to RAM at 0000:7000H and run:
+; REP STOSB overwrites the last three NOPs ahead with INC DX (42h) and DX counts
+; how many of the new bytes were fetched after the write. The 8088 fetches all
+; three, the 8086 has already queued some of the old NOPs.
+; Needs a CPU (or emulator) that models the prefetch queue.
+;
+; Output:
+;	ZF = 1 if 8088, ZF = 0 if 8086
+;
+; Clobbers: nothing else (AX, CX, DX, SI, DI, ES saved), interrupts disabled
+;----------------------------------------------------------------------------;
+CPU_QUEUE_TEST PROC
+	CLI
+	PUSH	AX
+	PUSH	CX
+	PUSH	DX
+	PUSH	DI
+	PUSH	SI
+	PUSH	ES
+	XOR	AX, AX
+	MOV	ES, AX				; ES = 0000, scratch RAM in low memory
+	MOV	DI, 7000H				; free during POST (boot sector goes to 7C00H)
+	PUSH	DI				; save RAM routine address
+	MOV	SI, OFFSET CQT_CODE
+	MOV	CX, OFFSET CQT_END - OFFSET CQT_CODE
+	CLD
+	DB	2EH					; CS: override, REP MOVSB source
+	REP	MOVSB				; copy routine to RAM
+	POP	DI				; DI = RAM routine
+	PUSH	CS				; far return address for the routine
+	MOV	AX, OFFSET CQT_RET
+	PUSH	AX
+	PUSH	ES				; ES = 0 = RAM code segment
+	PUSH	DI
+	RETF					; run the routine in RAM
+CQT_RET:
+	CMP	AL, 3				; 3 = all new bytes executed = 8088
+	POP	ES
+	POP	SI
+	POP	DI
+	POP	DX
+	POP	CX
+	POP	AX
+	RET
+
+;
+; Routine executed from RAM (position independent), returns the INC DX count in AL
+;
+CQT_CODE:
+	PUSH	CS
+	POP	ES				; ES = RAM code segment
+	XOR	DX, DX
+	STD
+	CALL	CQT_NEXT			; get own address
+CQT_NEXT:
+	POP	DI
+	ADD	DI, OFFSET CQT_LAST - OFFSET CQT_NEXT	; DI = last NOP
+	MOV	AL, 42H				; INC DX
+	MOV	CX, 3
+	REP	STOSB				; overwrite the last 3 NOPs (backwards)
+	CLD
+	NOP
+	NOP
+	NOP
+	NOP
+	NOP
+CQT_LAST:
+	NOP
+	MOV	AX, DX
+	RETF
+CQT_END:
+
+POST_8086		DB	'8086', 0
+
+CPU_QUEUE_TEST ENDP
+
 POST_END_COL ENDP
 
 ;----------------------------------------------------------------------------;
@@ -11201,9 +11452,15 @@ BYTE_HEX ENDP
 WORD_HEX ENDP
 DWORD_HEX ENDP
 
+				IF POST_ERR_LONG EQ 1
+;----------------------------------------------------------------------------;
+; WpfApp: descriptive POST error strings (see POST_ERRORS)
 ;
-; 46 BYTES HERE
-;
+POST_ERR_PKI	DB	'Keyboard not responding', 0	; no reset reply (AAh)
+POST_ERR_PKEY	DB	'Keyboard key stuck', 0		; scan code after reset
+POST_ERR_PFDC	DB	'Floppy controller failure', 0	; FDC reset failed
+				ENDIF
+
 BYTES_HERE	INT_12
 
 ;----------------------------------------------------------------------------;
@@ -11945,7 +12202,15 @@ HELLO_RAND_TAGLINE PROC
 	MOV	SI, CS:TAGS[SI]		; SI = chosen tagline offset
 	PRINT_SZ  SI			; display tagline
 	MOV	SI, OFFSET COPYRIGHT	; display copyright message
+			IF POST_ERR_LONG EQ 1
+	CALL	OUT_SZ
+	MOV	SI, OFFSET MOD_NOTE	; WpfApp: modified version notice
+			ENDIF
 	JMP	NEAR PTR OUTLN_SZ		; write and RET
+
+			IF POST_ERR_LONG EQ 1
+MOD_NOTE	DB	CR, 'Modified for the WpfApp emulator (', VER_NUM, '-emu)', LF, 0
+			ENDIF
 
 ;----------------------------------------------------------------------------;
 ; Three additional random taglines
